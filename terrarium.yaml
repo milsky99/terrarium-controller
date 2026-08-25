@@ -76,7 +76,6 @@ ota:
 http_request:
   verify_ssl: true
   timeout: 10s
-  
 
 update:
   - platform: http_request
@@ -93,7 +92,6 @@ update:
 wifi:
   ap:
     ssid: "Terrarium Setup"
-  ap_timeout: 1min
 
 captive_portal:
 
