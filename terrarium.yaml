@@ -76,7 +76,7 @@ ota:
 http_request:
   verify_ssl: true
   timeout: 10s
-  tls_buffer_size_rx: 16384
+  
 
 update:
   - platform: http_request
