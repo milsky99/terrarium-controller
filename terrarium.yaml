@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.5"
+  project_version: "1.0.6"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -177,6 +177,11 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+
+  - id: led_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
   - id: fan_auto
     type: bool
@@ -380,6 +385,7 @@ button:
       sorting_group_id: grp_system
       sorting_weight: 61
     on_press:
+      - script.execute: note_checking
       - update.check:
           id: fw_update
 
@@ -1029,7 +1035,8 @@ interval:
           bool want = problem ? ((id(led_tick) % 5) < 2)
                               : ((id(led_tick) % 30) < 1);
 
-          if (want != id(internalled).state) {
+          if (want != id(led_state)) {
+            id(led_state) = want;
             if (want) {
               id(internalled).turn_on();
             } else {
@@ -1038,6 +1045,9 @@ interval:
           }
 
 output:
+  - platform: gpio
+    pin: GPIO23
+    id: internalled
   - platform: gpio
     pin: GPIO26
     id: light_output
@@ -1086,6 +1096,15 @@ fan:
                         - script.execute: fan_delayed_off
 
 script:
+  # Shows a brief acknowledgement when Check For Update is pressed, then
+  # clears it. Nothing is left behind that could later be out of date.
+  - id: note_checking
+    mode: restart
+    then:
+      - lambda: id(update_status_text).publish_state("Checking for updates...");
+      - delay: 10s
+      - lambda: id(update_status_text).publish_state("");
+
   # Stores the current 3 minute average as full or empty.
   # Refuses if the two points would end up within 100 counts of each other.
   - id: store_calibration
@@ -1454,10 +1473,3 @@ switch:
     turn_off_action:
       - lambda: id(note_setting)->execute(std::string("Fan Automation off"));
       - script.stop: fan_cycle_loop
-
-  - platform: gpio
-    pin: GPIO23
-    name: "InternalLED"
-    id: internalled
-    internal: true
-    restore_mode: ALWAYS_OFF
