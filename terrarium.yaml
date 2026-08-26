@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.1"
+  project_version: "1.0.0"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -85,7 +85,8 @@ update:
     name: "Firmware Update"
     id: fw_update
     source: ${manifest_url}
-    update_interval: 6h
+    # TESTING ONLY. Put this back to 6h once the update loop is proven.
+    update_interval: 5min
     web_server:
       sorting_group_id: grp_system
       sorting_weight: 60
