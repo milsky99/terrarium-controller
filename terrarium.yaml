@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.1"
+  project_version: "1.0.2"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -74,6 +74,14 @@ api:
 ota:
   - platform: esphome
   - platform: http_request
+    on_progress:
+      - lambda: |-
+          char b[48];
+          snprintf(b, sizeof(b), "Downloading... %.0f%%", x);
+          id(update_status_text).publish_state(std::string(b));
+    on_error:
+      - lambda: |-
+          id(update_status_text).publish_state("Update failed - try again later");
 
 # Used to fetch the update manifest and the new firmware.
 http_request:
@@ -90,6 +98,9 @@ update:
     web_server:
       sorting_group_id: grp_system
       sorting_weight: 60
+    on_update_available:
+      - lambda: |-
+          id(update_status_text).publish_state("New firmware available - press Install Update");
 
 # No network saved. On first boot the unit starts its own open hotspot
 # named after the device, so the code shown in the phone's WiFi list is
@@ -358,6 +369,36 @@ sensor:
     lambda: 'return id(cal_empty);'
 
 button:
+  # ----- Firmware -----
+  - platform: template
+    name: "Check For Update"
+    icon: "mdi:cloud-search-outline"
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 61
+    on_press:
+      - lambda: id(update_status_text).publish_state("Checking...");
+      - update.check:
+          id: fw_update
+
+  - platform: template
+    name: "Install Update"
+    icon: "mdi:cloud-download-outline"
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 62
+    on_press:
+      - if:
+          condition:
+            update.is_available:
+              id: fw_update
+          then:
+            - lambda: id(update_status_text).publish_state("Starting download...");
+            - update.perform:
+                id: fw_update
+          else:
+            - lambda: id(update_status_text).publish_state("Nothing to install - press Check For Update first");
+
   - platform: template
     name: "Set Full"
     icon: "mdi:cup-water"
@@ -381,6 +422,16 @@ button:
           is_full: false
 
 text_sensor:
+  # Plain english report of what the update system is doing.
+  - platform: template
+    name: "Update Status"
+    id: update_status_text
+    icon: "mdi:cloud-sync-outline"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 63
+
   - platform: wifi_info
     ip_address:
       name: "IP Address"
