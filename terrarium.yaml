@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.0"
+  project_version: "1.0.1"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -452,7 +452,7 @@ text_sensor:
 
   # ----- Calibration -----
   - platform: template
-    name: "How To Calibrate"
+    name: "The mister will be damaged if it runs without water. Calibrate on first use, and check the calibration regularly."
     id: cal_help
     icon: "mdi:information-outline"
     update_interval: 300s
@@ -460,7 +460,7 @@ text_sensor:
       sorting_group_id: grp_cal
       sorting_weight: 5
     lambda: |-
-      return {"Wait 3 minutes after filling or emptying before pressing a button. For empty, lift the wire out. When replacing it, push it all the way down into the container or readings will be wrong."};
+      return {"Fill the tank completely, wait 3 minutes, press Set Full. Then remove the sensor wire from the small hole, leave it 3 minutes, press Set Empty. Return the wire to the tank, pushing it all the way down. Damage is likely if this is not done, or if Water Level Control is switched off."};
 
   - platform: template
     name: "Calibration Status"
@@ -574,6 +574,27 @@ text_sensor:
     web_server:
       sorting_group_id: grp_history
       sorting_weight: 50
+
+text:
+  # A label the owner can set themselves, so several units can be told
+  # apart. It does NOT change the page title or the network name, both of
+  # which are fixed when the firmware is built.
+  - platform: template
+    name: "Unit Name"
+    id: unit_label
+    icon: "mdi:tag-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: "My Terrarium"
+    min_length: 0
+    max_length: 30
+    mode: text
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 5
+    on_value:
+      - lambda: |-
+          id(note_setting)->execute(std::string("Unit Name changed"));
 
 number:
   # ----- Water -----
