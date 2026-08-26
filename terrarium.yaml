@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.3"
+  project_version: "1.0.4"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -56,13 +56,12 @@ dashboard_import:
 logger:
   level: DEBUG
   logs:
+    # Quiet: these report on a timer, not when something happens.
     sensor: WARN
     text_sensor: WARN
-    number: WARN
-    switch: WARN
-    light: WARN
-    fan: WARN
-    script: WARN
+    esp32_touch: WARN
+    # Everything else is left alone on purpose, so real events show up:
+    # switches, lights, fans, sliders and scripts.
 
 # No encryption key here on purpose. A key baked into public firmware
 # would be readable by anyone. Home Assistant still finds and adopts it.
@@ -97,9 +96,6 @@ update:
     web_server:
       sorting_group_id: grp_system
       sorting_weight: 60
-    on_update_available:
-      - lambda: |-
-          id(update_status_text).publish_state("New firmware available - press Install Update");
 
 # No network saved. On first boot the unit starts its own open hotspot
 # named after the device, so the code shown in the phone's WiFi list is
@@ -174,6 +170,11 @@ time:
                 - script.execute: mister_cycle
 
 globals:
+  - id: led_tick
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   - id: fan_auto
     type: bool
     restore_value: no
@@ -376,7 +377,6 @@ button:
       sorting_group_id: grp_system
       sorting_weight: 61
     on_press:
-      - lambda: id(update_status_text).publish_state("Checking...");
       - update.check:
           id: fw_update
 
@@ -395,8 +395,6 @@ button:
             - lambda: id(update_status_text).publish_state("Starting download...");
             - update.perform:
                 id: fw_update
-          else:
-            - lambda: id(update_status_text).publish_state("Nothing to install - press Check For Update first");
 
   - platform: template
     name: "Set Full"
@@ -1004,6 +1002,36 @@ number:
           } else {
             snprintf(b, sizeof(b), "Fan Run After Mist to %.0f min", x);
             id(note_setting)->execute(std::string(b));
+          }
+
+# ----- Board LED status light -----
+# Short blink every 3 seconds: running normally.
+# Twice a second: water low, or no clock so the mist schedule cannot run.
+# The clock warning is held back for the first 5 minutes after power up,
+# so a new unit does not appear faulty while it finds the time.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          id(led_tick)++;
+
+          bool problem = false;
+          if (id(water_control).state && id(water_low).state) {
+            problem = true;
+          }
+          if (millis() > 300000 && !id(board_time).now().is_valid()) {
+            problem = true;
+          }
+
+          bool want = problem ? ((id(led_tick) % 5) < 2)
+                              : ((id(led_tick) % 30) < 1);
+
+          if (want != id(internalled).state) {
+            if (want) {
+              id(internalled).turn_on();
+            } else {
+              id(internalled).turn_off();
+            }
           }
 
 output:
