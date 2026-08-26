@@ -573,7 +573,7 @@ text_sensor:
       return {"This erases everything, including the WiFi details, and returns the unit to how it left the factory. You will have to set it up again from the start. There is no undo."};
 
   - platform: template
-    name: "Warning"
+    name: "Important"
     id: cal_warning
     icon: "mdi:alert-outline"
     update_interval: 300s
