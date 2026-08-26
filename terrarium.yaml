@@ -5,9 +5,9 @@
 # and offer it as an update.
 
 substitutions:
-  device_name: terrarium
-  device_friendly_name: Terrarium
-  project_version: "1.0.0"
+  device_name: plant
+  device_friendly_name: Plant
+  project_version: "1.0.1"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -18,7 +18,7 @@ esphome:
   # is unique on the network from a single firmware build.
   name_add_mac_suffix: true
   project:
-    name: milsky99.terrarium
+    name: milsky99.plant
     version: "${project_version}"
   on_boot:
     priority: 600
@@ -66,7 +66,10 @@ logger:
 
 # No encryption key here on purpose. A key baked into public firmware
 # would be readable by anyone. Home Assistant still finds and adopts it.
+# reboot_timeout 0s stops the unit rebooting every 15 minutes when no
+# Home Assistant is present. Most owners will not have one.
 api:
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -88,10 +91,13 @@ update:
       sorting_weight: 60
 
 # No network saved. On first boot the unit starts its own open hotspot
-# called Terrarium Setup. Join it with a phone and the setup page appears.
+# named after the device, so the code shown in the phone's WiFi list is
+# the same code used to reach the unit later.
+# reboot_timeout 0s means a router outage does not interrupt misting.
+# The fallback hotspot still appears when the network is genuinely gone.
 wifi:
+  reboot_timeout: 0s
   ap:
-    ssid: "Terrarium Setup"
 
 captive_portal:
 
