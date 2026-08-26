@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.4"
+  project_version: "1.0.5"
   manifest_url: https://milsky99.github.io/terrarium-controller/firmware/manifest.json
 
 # Board: Generic ESP32 Board (Generic)
@@ -54,12 +54,1413 @@ dashboard_import:
   import_full_config: false
 
 logger:
-  level: DEBUG
+  # level decides what is built into the firmware at all.
+  # initial_level then hides it, so the device is quiet by default.
+  # The tags below are switched back on, and only those are shown.
+  # Result: mist, fan, light and slider changes appear. Nothing else.
+  level: VERBOSE
+  initial_level: WARN
   logs:
-    # Quiet: these report on a timer, not when something happens.
-    sensor: WARN
-    text_sensor: WARN
-    esp32_touch: WARN
+    switch: VERBOSE
+    light: VERBOSE
+    fan: VERBOSE
+    number: VERBOSE
+
+# No encryption key here on purpose. A key baked into public firmware
+# would be readable by anyone. Home Assistant still finds and adopts it.
+# reboot_timeout 0s stops the unit rebooting every 15 minutes when no
+# Home Assistant is present. Most owners will not have one.
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+  - platform: http_request
+    on_progress:
+      - lambda: |-
+          char b[48];
+          snprintf(b, sizeof(b), "Downloading... %.0f%%", x);
+          id(update_status_text).publish_state(std::string(b));
+    on_error:
+      - lambda: |-
+          id(update_status_text).publish_state("Update failed - try again later");
+
+# Used to fetch the update manifest and the new firmware.
+http_request:
+  verify_ssl: true
+  timeout: 10s
+
+update:
+  - platform: http_request
+    name: "Firmware Update"
+    id: fw_update
+    source: ${manifest_url}
+    update_interval: 6h
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 60
+
+# No network saved. On first boot the unit starts its own open hotspot
+# named after the device, so the code shown in the phone's WiFi list is
+# the same code used to reach the unit later.
+# reboot_timeout 0s means a router outage does not interrupt misting.
+# The fallback hotspot still appears when the network is genuinely gone.
+wifi:
+  reboot_timeout: 0s
+  ap:
+
+captive_portal:
+
+web_server:
+  version: 3
+  sorting_groups:
+    - id: grp_system
+      name: "System"
+      sorting_weight: 10
+    - id: grp_light
+      name: "Light"
+      sorting_weight: 20
+    - id: grp_water
+      name: "Water"
+      sorting_weight: 25
+    - id: grp_cal
+      name: "Water Calibration"
+      sorting_weight: 60
+    - id: grp_mist
+      name: "Mister"
+      sorting_weight: 30
+    - id: grp_fan
+      name: "Fan"
+      sorting_weight: 40
+    - id: grp_history
+      name: "History"
+      sorting_weight: 70
+
+time:
+  - platform: sntp
+    id: board_time
+    timezone: Africa/Johannesburg
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+    on_time_sync:
+      then:
+        - lambda: |-
+            if (!id(boot_logged)) {
+              id(boot_logged) = true;
+              id(last_boot_text).publish_state(id(board_time).now().strftime("%a %H:%M"));
+            }
+        - component.update: clock_status
+        - script.execute: rebuild_schedule
+        - script.execute: light_check
+    on_time:
+      - seconds: 0
+        minutes: 0
+        then:
+          - script.execute: light_check
+          - if:
+              condition:
+                and:
+                  - switch.is_on: mist_enable
+                  - lambda: |-
+                      int h = id(board_time).now().hour;
+                      for (int i = 0; i < id(mist_hours_n); i++) {
+                        if (id(mist_hours)[i] == h) return true;
+                      }
+                      return false;
+              then:
+                - script.execute: mister_cycle
+
+globals:
+  - id: led_tick
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: fan_auto
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: boot_logged
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: mist_hours
+    type: int[6]
+    restore_value: no
+
+  - id: mist_hours_n
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # ----- Stored calibration, survives restarts and reflashes -----
+  - id: cal_full
+    type: float
+    restore_value: yes
+    initial_value: '500.0'
+
+  - id: cal_empty
+    type: float
+    restore_value: yes
+    initial_value: '1403.0'
+
+  # What happened last: 0 never, 1 full set, 2 empty set, 3 rejected
+  - id: cal_last
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: cal_value
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: cal_time
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+# ----- Capacitive water probe hub -----
+# LEAVE setup_mode ON. The raw value only keeps updating while this is true.
+# Turning it off freezes get_value(), which freezes every average below it.
+esp32_touch:
+  id: touch_hub
+  setup_mode: true
+
+binary_sensor:
+  # The probe itself. Hidden, it exists only to feed the raw reading.
+  # Its threshold is required by ESPHome but is NOT used for any decisions.
+  - platform: esp32_touch
+    id: water_probe
+    pin: GPIO32
+    threshold: 1000
+    internal: true
+
+  # Low when the percentage drops below the Minimum Water Level slider.
+  - platform: template
+    id: water_low
+    internal: true
+    lambda: |-
+      if (std::isnan(id(water_percent).state)) return {};
+      return id(water_percent).state < id(min_water_level).state;
+    filters:
+      - delayed_on: 30s
+      - delayed_off: 30s
+    on_press:
+      - if:
+          condition:
+            and:
+              - switch.is_on: water_control
+              - switch.is_on: mister
+          then:
+            - script.execute: mister_stop
+
+sensor:
+  - platform: wifi_signal
+    id: wifi_signal_db
+    internal: true
+    update_interval: 60s
+
+  # ----- Water probe -----
+  # Samples once a second. Hidden, it only feeds the averages below.
+  - platform: template
+    id: touch_raw
+    internal: true
+    lambda: 'return id(water_probe).get_value();'
+    update_interval: 1s
+
+  - platform: copy
+    source_id: touch_raw
+    name: "Probe 10 second"
+    id: touch_avg_10s
+    icon: "mdi:blur"
+    unit_of_measurement: "counts"
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 30
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+
+  # This is the one that drives the percentage and the automation.
+  - platform: copy
+    source_id: touch_raw
+    name: "Probe 3 minute"
+    id: touch_avg_3m
+    icon: "mdi:blur"
+    unit_of_measurement: "counts"
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 40
+    filters:
+      - sliding_window_moving_average:
+          window_size: 180
+          send_every: 5
+
+  - platform: copy
+    source_id: touch_raw
+    name: "Probe 10 minute"
+    id: touch_avg_10m
+    icon: "mdi:blur"
+    unit_of_measurement: "counts"
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 60
+    filters:
+      - sliding_window_moving_average:
+          window_size: 600
+          send_every: 15
+
+  # Percentage worked out from the stored calibration.
+  # Works whichever way round full and empty are.
+  - platform: template
+    name: "Water Level"
+    id: water_percent
+    icon: "mdi:water-percent"
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 25
+    lambda: |-
+      float v = id(touch_avg_3m).state;
+      if (std::isnan(v)) return {};
+      float f = id(cal_full);
+      float e = id(cal_empty);
+      if (fabsf(f - e) < 1.0f) return {};
+      float p = (v - e) / (f - e) * 100.0f;
+      if (p < 0.0f) p = 0.0f;
+      if (p > 100.0f) p = 100.0f;
+      return p;
+
+  # ----- Calibration readouts -----
+  - platform: template
+    name: "Calibrated Full"
+    id: cal_full_display
+    icon: "mdi:cup-water"
+    unit_of_measurement: "counts"
+    accuracy_decimals: 0
+    update_interval: 30s
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 30
+    lambda: 'return id(cal_full);'
+
+  - platform: template
+    name: "Calibrated Empty"
+    id: cal_empty_display
+    icon: "mdi:cup-outline"
+    unit_of_measurement: "counts"
+    accuracy_decimals: 0
+    update_interval: 30s
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 40
+    lambda: 'return id(cal_empty);'
+
+button:
+  # ----- Firmware -----
+  - platform: template
+    name: "Check For Update"
+    icon: "mdi:cloud-search-outline"
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 61
+    on_press:
+      - update.check:
+          id: fw_update
+
+  - platform: template
+    name: "Install Update"
+    icon: "mdi:cloud-download-outline"
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 62
+    on_press:
+      - if:
+          condition:
+            update.is_available:
+              id: fw_update
+          then:
+            - lambda: id(update_status_text).publish_state("Starting download...");
+            - update.perform:
+                id: fw_update
+
+  - platform: template
+    name: "Set Full"
+    icon: "mdi:cup-water"
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 10
+    on_press:
+      - script.execute:
+          id: store_calibration
+          is_full: true
+
+  - platform: template
+    name: "Set Empty"
+    icon: "mdi:cup-outline"
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 20
+    on_press:
+      - script.execute:
+          id: store_calibration
+          is_full: false
+
+text_sensor:
+  # Plain english report of what the update system is doing.
+  - platform: template
+    name: "Update Status"
+    id: update_status_text
+    icon: "mdi:cloud-sync-outline"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 63
+
+  - platform: template
+    name: "Installed Version"
+    id: installed_version_text
+    icon: "mdi:tag-check-outline"
+    update_interval: 300s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 64
+    lambda: 'return {"${project_version}"};'
+
+  # If the build rejects this block, delete it. The Update Status line
+  # still reports when a new version is waiting, just without the number.
+  - platform: template
+    name: "Available Version"
+    id: available_version_text
+    icon: "mdi:tag-arrow-up-outline"
+    update_interval: 300s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 65
+    lambda: |-
+      std::string v = id(fw_update)->update_info.latest_version;
+      if (v.empty()) return {"not checked yet"};
+      return {v};
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      web_server:
+        sorting_group_id: grp_system
+        sorting_weight: 50
+    ssid:
+      name: "Network Name"
+      web_server:
+        sorting_group_id: grp_system
+        sorting_weight: 20
+    bssid:
+      name: "Router ID"
+      web_server:
+        sorting_group_id: grp_system
+        sorting_weight: 30
+
+  - platform: template
+    name: "Clock"
+    id: clock_status
+    icon: "mdi:clock-outline"
+    update_interval: 30s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 10
+    lambda: |-
+      auto t = id(board_time).now();
+      if (!t.is_valid()) {
+        return {"Could not retrieve the time, not connected to the internet, daily misting schedule is not available"};
+      }
+      return {t.strftime("%H:%M  %a %d %b %Y")};
+
+  - platform: template
+    name: "Signal Strength"
+    id: wifi_signal_text
+    icon: "mdi:wifi"
+    update_interval: 300s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 40
+    lambda: |-
+      float db = id(wifi_signal_db).state;
+      if (std::isnan(db)) return {"no reading"};
+      if (db >= -55) return {"████  Excellent"};
+      if (db >= -67) return {"███░  Good"};
+      if (db >= -75) return {"██░░  Fair"};
+      if (db >= -85) return {"█░░░  Weak"};
+      return {"░░░░  Very weak"};
+
+  - platform: template
+    name: "Water Status"
+    id: water_status_text
+    icon: "mdi:water-check"
+    update_interval: 5s
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 20
+    lambda: |-
+      if (!id(water_control).state) {
+        return {"Water check off - misting always allowed"};
+      }
+      if (std::isnan(id(water_percent).state)) {
+        return {"Warming up - waiting for a stable reading"};
+      }
+      if (id(water_low).state) {
+        return {"Water low ! - automation off"};
+      }
+      return {"Water level ok - automation running"};
+
+  # ----- Calibration -----
+  - platform: template
+    name: "The mister will be damaged if it runs without water. Calibrate on first use, and check the calibration regularly."
+    id: cal_help
+    icon: "mdi:information-outline"
+    update_interval: 300s
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 5
+    lambda: |-
+      return {"Fill the tank completely, wait 3 minutes, press Set Full. Then remove the sensor wire from the small hole, leave it 3 minutes, press Set Empty. Return the wire to the tank, pushing it all the way down. Damage is likely if this is not done, or if Water Level Control is switched off."};
+
+  - platform: template
+    name: "Calibration Status"
+    id: cal_status_text
+    icon: "mdi:tune-vertical"
+    update_interval: 10s
+    web_server:
+      sorting_group_id: grp_cal
+      sorting_weight: 50
+    lambda: |-
+      char b[120];
+      if (id(cal_last) == 0) {
+        return {"Never calibrated - using built in values"};
+      }
+      std::string ts = "no clock";
+      if (id(cal_time) > 0) {
+        ts = ESPTime::from_epoch_local(id(cal_time)).strftime("%a %H:%M");
+      }
+      if (id(cal_last) == 3) {
+        snprintf(b, sizeof(b), "Rejected %.0f - too close to the other value. Nothing changed. %s",
+                 id(cal_value), ts.c_str());
+      } else {
+        snprintf(b, sizeof(b), "%s set to %.0f - %s",
+                 id(cal_last) == 1 ? "Full" : "Empty", id(cal_value), ts.c_str());
+      }
+      return {std::string(b)};
+
+  - platform: template
+    name: "Mist Times"
+    id: mist_schedule_text
+    icon: "mdi:calendar-clock"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 30
+    lambda: |-
+      std::string s = "";
+      char buf[8];
+      for (int i = 0; i < id(mist_hours_n); i++) {
+        snprintf(buf, sizeof(buf), "%02d:00", id(mist_hours)[i]);
+        if (i > 0) s += ", ";
+        s += buf;
+      }
+      if (s.empty()) s = "none";
+      return {s};
+
+  # Plain english readout of the burst pattern
+  - platform: template
+    name: "Mist Pattern"
+    id: mist_pattern_text
+    icon: "mdi:chart-timeline-variant"
+    update_interval: 30s
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 85
+    lambda: |-
+      int on = (int) id(mist_on_seconds).state;
+      int off = 30 - on;
+      char b[80];
+      if (on <= 0) {
+        return {"Off time only - the mister will not run"};
+      }
+      if (off <= 0) {
+        return {"Runs without stopping for the whole mist duration"};
+      }
+      snprintf(b, sizeof(b), "%d sec on, %d sec off, repeating", on, off);
+      return {std::string(b)};
+
+  # ----- History -----
+  - platform: template
+    name: "Last Mist"
+    id: last_mist_text
+    icon: "mdi:sprinkler-variant"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 10
+
+  - platform: template
+    name: "Last Fan Run"
+    id: last_fan_text
+    icon: "mdi:fan"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 20
+
+  - platform: template
+    name: "Last Light Change"
+    id: last_light_text
+    icon: "mdi:lightbulb"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 30
+
+  - platform: template
+    name: "Last Setting Change"
+    id: last_setting_text
+    icon: "mdi:tune"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 40
+
+  - platform: template
+    name: "Last Boot"
+    id: last_boot_text
+    icon: "mdi:restart"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 50
+
+  # ----- Rolling log of the last 10 events, newest first -----
+  # Held in memory only. A power cut empties it. Writing every event to
+  # flash would wear the chip out, so it is deliberately not saved.
+  - platform: template
+    name: "1"
+    id: hist1
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 101
+  - platform: template
+    name: "2"
+    id: hist2
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 102
+  - platform: template
+    name: "3"
+    id: hist3
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 103
+  - platform: template
+    name: "4"
+    id: hist4
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 104
+  - platform: template
+    name: "5"
+    id: hist5
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 105
+  - platform: template
+    name: "6"
+    id: hist6
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 106
+  - platform: template
+    name: "7"
+    id: hist7
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 107
+  - platform: template
+    name: "8"
+    id: hist8
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 108
+  - platform: template
+    name: "9"
+    id: hist9
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 109
+  - platform: template
+    name: "10"
+    id: hist10
+    icon: "mdi:history"
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_history
+      sorting_weight: 110
+
+text:
+  # A label the owner can set themselves, so several units can be told
+  # apart. It does NOT change the page title or the network name, both of
+  # which are fixed when the firmware is built.
+  - platform: template
+    name: "Unit Name"
+    id: unit_label
+    icon: "mdi:tag-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: "My Terrarium"
+    min_length: 0
+    max_length: 30
+    mode: text
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 5
+    on_value:
+      - lambda: |-
+          id(note_setting)->execute(std::string("Unit Name changed"));
+
+number:
+  # ----- Water -----
+  # Misting stops below this percentage, as long as Water Level Control is on.
+  - platform: template
+    name: "Minimum Water Level"
+    id: min_water_level
+    icon: "mdi:water-alert-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+    min_value: 15
+    max_value: 40
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 15
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Minimum Water Level to %.0f%%", x);
+          id(note_setting)->execute(std::string(b));
+
+  # ----- Light -----
+  - platform: template
+    name: "Light On Hour"
+    id: light_start_hour
+    icon: "mdi:weather-sunny"
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_light
+      sorting_weight: 30
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Light On Hour to %02.0f:00", x);
+          id(note_setting)->execute(std::string(b));
+      - script.execute: light_check
+
+  - platform: template
+    name: "Light Off Hour"
+    id: light_end_hour
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_value: true
+    initial_value: 22
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_light
+      sorting_weight: 40
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Light Off Hour to %02.0f:00", x);
+          id(note_setting)->execute(std::string(b));
+      - script.execute: light_check
+
+  # ----- Mister -----
+  - platform: template
+    name: "Mist Start Hour"
+    id: mist_start_hour
+    icon: "mdi:clock-start"
+    optimistic: true
+    restore_value: true
+    initial_value: 19
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 40
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Mist Start Hour to %02.0f:00", x);
+          id(note_setting)->execute(std::string(b));
+      - script.execute: rebuild_schedule
+
+  - platform: template
+    name: "Mist End Hour"
+    id: mist_end_hour
+    icon: "mdi:clock-end"
+    optimistic: true
+    restore_value: true
+    initial_value: 23
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 50
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Mist End Hour to %02.0f:00", x);
+          id(note_setting)->execute(std::string(b));
+      - script.execute: rebuild_schedule
+
+  - platform: template
+    name: "Mists Per Day"
+    id: mist_count
+    icon: "mdi:counter"
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 6
+    step: 1
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 60
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Mists Per Day to %.0f", x);
+          id(note_setting)->execute(std::string(b));
+      - script.execute: rebuild_schedule
+
+  - platform: template
+    name: "Mist Duration"
+    id: mister_run_time
+    icon: "mdi:timer-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 1
+    max_value: 10
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 70
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Mist Duration to %.0f min", x);
+          id(note_setting)->execute(std::string(b));
+
+  # How many of every 30 seconds the mister is actually spraying.
+  # 30 means it never pauses. 0 means it never sprays.
+  - platform: template
+    name: "Mist On Time"
+    id: mist_on_seconds
+    icon: "mdi:timer-play-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0
+    max_value: 30
+    step: 1
+    unit_of_measurement: "s"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 80
+    on_value:
+      - lambda: |-
+          char b[72];
+          snprintf(b, sizeof(b), "Mist On Time to %.0f sec in every 30", x);
+          id(note_setting)->execute(std::string(b));
+      - component.update: mist_pattern_text
+
+  # ----- Fan -----
+  # How long to wait between daily airings.
+  - platform: template
+    name: "Daily Fan Cycle Interval"
+    id: fan_cycle_hours
+    icon: "mdi:timer-sync-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: 4
+    min_value: 1
+    max_value: 6
+    step: 1
+    unit_of_measurement: "h"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_fan
+      sorting_weight: 30
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Daily Fan Cycle Interval to %.0f h", x);
+          id(note_setting)->execute(std::string(b));
+
+  # How long each daily airing lasts.
+  - platform: template
+    name: "Daily Fan Run Time"
+    id: fan_purge_seconds
+    icon: "mdi:fan-clock"
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 10
+    max_value: 300
+    step: 10
+    unit_of_measurement: "s"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_fan
+      sorting_weight: 35
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Daily Fan Run Time to %.0f sec", x);
+          id(note_setting)->execute(std::string(b));
+
+  # How long the fan keeps going once misting ends. 0 means it does not run on.
+  - platform: template
+    name: "Fan Run After Mist"
+    id: fan_runon_time
+    icon: "mdi:fan-plus"
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 0
+    max_value: 5
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_fan
+      sorting_weight: 40
+    on_value:
+      - lambda: |-
+          char b[72];
+          if (x < 1) {
+            id(note_setting)->execute(std::string("Fan Run After Mist off"));
+          } else {
+            snprintf(b, sizeof(b), "Fan Run After Mist to %.0f min", x);
+            id(note_setting)->execute(std::string(b));
+          }
+
+# ----- Board LED status light -----
+# Short blink every 3 seconds: running normally.
+# Twice a second: water low, or no clock so the mist schedule cannot run.
+# The clock warning is held back for the first 5 minutes after power up,
+# so a new unit does not appear faulty while it finds the time.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          id(led_tick)++;
+
+          bool problem = false;
+          if (id(water_control).state && id(water_low).state) {
+            problem = true;
+          }
+          if (millis() > 300000 && !id(board_time).now().is_valid()) {
+            problem = true;
+          }
+
+          bool want = problem ? ((id(led_tick) % 5) < 2)
+                              : ((id(led_tick) % 30) < 1);
+
+          if (want != id(internalled).state) {
+            if (want) {
+              id(internalled).turn_on();
+            } else {
+              id(internalled).turn_off();
+            }
+          }
+
+output:
+  - platform: gpio
+    pin: GPIO26
+    id: light_output
+  - platform: gpio
+    pin: GPIO17
+    id: fan_output
+
+light:
+  - platform: binary
+    name: "Light"
+    id: puc_light
+    output: light_output
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: grp_light
+      sorting_weight: 10
+    on_turn_on:
+      - lambda: id(note_light)->execute(std::string("on"));
+    on_turn_off:
+      - lambda: id(note_light)->execute(std::string("off"));
+
+fan:
+  - platform: binary
+    name: "Fan"
+    id: mister_fan
+    output: fan_output
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: grp_fan
+      sorting_weight: 10
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(fan_auto);'
+          then:
+            - if:
+                condition:
+                  switch.is_on: mister
+                then:
+                  - script.execute: mister_stop
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(fan_runon_time).state >= 1;'
+                      then:
+                        - script.execute: fan_delayed_off
+
+script:
+  # Stores the current 3 minute average as full or empty.
+  # Refuses if the two points would end up within 100 counts of each other.
+  - id: store_calibration
+    mode: single
+    parameters:
+      is_full: bool
+    then:
+      - lambda: |-
+          float v = id(touch_avg_3m).state;
+          auto n = id(board_time).now();
+          id(cal_time) = n.is_valid() ? n.timestamp : 0;
+
+          if (std::isnan(v)) {
+            id(cal_last) = 3;
+            id(cal_value) = 0;
+            return;
+          }
+
+          float other = is_full ? id(cal_empty) : id(cal_full);
+          if (fabsf(v - other) < 100.0f) {
+            id(cal_last) = 3;
+            id(cal_value) = v;
+            return;
+          }
+
+          if (is_full) {
+            id(cal_full) = v;
+            id(cal_last) = 1;
+          } else {
+            id(cal_empty) = v;
+            id(cal_last) = 2;
+          }
+          id(cal_value) = v;
+      - component.update: cal_status_text
+      - component.update: cal_full_display
+      - component.update: cal_empty_display
+
+  # ----- History helpers -----
+  # Pushes one line onto the rolling log, shifting everything down.
+  - id: note_history
+    mode: single
+    parameters:
+      what: string
+    then:
+      - lambda: |-
+          auto t = id(board_time).now();
+          std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+          esphome::text_sensor::TextSensor *h[10] = {
+            id(hist1), id(hist2), id(hist3), id(hist4), id(hist5),
+            id(hist6), id(hist7), id(hist8), id(hist9), id(hist10)
+          };
+          for (int i = 9; i > 0; i--) {
+            h[i]->publish_state(h[i - 1]->state);
+          }
+          h[0]->publish_state(ts + " - " + what);
+
+  - id: note_setting
+    mode: parallel
+    parameters:
+      what: string
+    then:
+      - lambda: |-
+          auto t = id(board_time).now();
+          std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+          id(last_setting_text).publish_state(ts + " - " + what);
+      - script.execute:
+          id: note_history
+          what: !lambda 'return what;'
+
+  - id: note_light
+    mode: parallel
+    parameters:
+      what: string
+    then:
+      - lambda: |-
+          auto t = id(board_time).now();
+          std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+          id(last_light_text).publish_state(ts + " - switched " + what);
+      - script.execute:
+          id: note_history
+          what: !lambda 'return "light switched " + what;'
+
+  - id: note_fan
+    mode: parallel
+    parameters:
+      what: string
+    then:
+      - lambda: |-
+          auto t = id(board_time).now();
+          std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+          id(last_fan_text).publish_state(ts + " - " + what);
+      - script.execute:
+          id: note_history
+          what: !lambda 'return "fan " + what;'
+
+  # Works out the misting hours and updates the display
+  - id: rebuild_schedule
+    mode: single
+    then:
+      - lambda: |-
+          int start = (int) id(mist_start_hour).state;
+          int end   = (int) id(mist_end_hour).state;
+          int n     = (int) id(mist_count).state;
+          if (n < 1) n = 1;
+          if (n > 6) n = 6;
+
+          int window = end - start;
+          if (window < 0) window += 24;
+
+          int step = 0;
+          if (n > 1) {
+            step = (window + (n - 1) / 2) / (n - 1);
+            if (step < 1) step = 1;
+          }
+
+          int cnt = 0;
+          int last = -1;
+          for (int i = 0; i < n; i++) {
+            int offset = i * step;
+            if (offset > window) break;
+            int h = (start + offset) % 24;
+            if (h == last) continue;
+            id(mist_hours)[cnt] = h;
+            last = h;
+            cnt++;
+          }
+          if (cnt == 0) {
+            id(mist_hours)[0] = start;
+            cnt = 1;
+          }
+          id(mist_hours_n) = cnt;
+      - component.update: mist_schedule_text
+
+  # Puts the light where it should be for the current hour
+  - id: light_check
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: light_auto_enable
+              - lambda: 'return id(board_time).now().is_valid();'
+          then:
+            - lambda: |-
+                int h = id(board_time).now().hour;
+                int s = (int) id(light_start_hour).state;
+                int e = (int) id(light_end_hour).state;
+                bool want;
+                if (s == e) want = false;
+                else if (s < e) want = (h >= s && h < e);
+                else want = (h >= s || h < e);
+                if (want != id(puc_light).current_values.is_on()) {
+                  if (want) id(puc_light).turn_on().perform();
+                  else id(puc_light).turn_off().perform();
+                }
+
+  # Runs a full misting cycle in repeating 30 second blocks.
+  # Mist On Time sets how much of each block is spraying, the rest is a pause.
+  # Blocked only when the water check is on AND the water reads low
+  - id: mister_cycle
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: water_control
+              - binary_sensor.is_on: water_low
+          then:
+            - lambda: |-
+                id(mister).publish_state(false);
+                auto t = id(board_time).now();
+                std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+                id(last_mist_text).publish_state(ts + " - skipped, water low");
+            - script.execute:
+                id: note_history
+                what: !lambda 'return "mist skipped, water low";'
+          else:
+            - lambda: |-
+                auto t = id(board_time).now();
+                std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
+                char b[80];
+                snprintf(b, sizeof(b), "%s - %.0f min, %.0f sec on in every 30",
+                         ts.c_str(), id(mister_run_time).state, id(mist_on_seconds).state);
+                id(last_mist_text).publish_state(std::string(b));
+                id(mister).publish_state(true);
+            - script.execute:
+                id: note_history
+                what: !lambda |-
+                  char c[64];
+                  snprintf(c, sizeof(c), "mist started, %.0f min", id(mister_run_time).state);
+                  return std::string(c);
+            - script.stop: fan_delayed_off
+            - script.stop: fan_purge
+            - lambda: id(fan_auto) = true;
+            - repeat:
+                # Each block is 30 seconds, spray time plus pause time
+                count: !lambda "return (uint32_t)((id(mister_run_time).state * 60.0) / 30.0);"
+                then:
+                  - if:
+                      condition:
+                        or:
+                          - switch.is_off: water_control
+                          - binary_sensor.is_off: water_low
+                      then:
+                        # Spray part of the block, skipped when set to 0
+                        - if:
+                            condition:
+                              lambda: 'return id(mist_on_seconds).state >= 1;'
+                            then:
+                              - fan.turn_on: mister_fan
+                              - switch.turn_on: mister_relay
+                              - delay: !lambda "return (uint32_t)(id(mist_on_seconds).state * 1000);"
+                              - switch.turn_off: mister_relay
+                        # Pause part of the block, skipped when set to 30
+                        - if:
+                            condition:
+                              lambda: 'return id(mist_on_seconds).state <= 29;'
+                            then:
+                              - fan.turn_off: mister_fan
+                              - delay: !lambda "return (uint32_t)((30.0 - id(mist_on_seconds).state) * 1000);"
+            - script.execute: mister_stop
+
+  # The single shutdown routine everything uses
+  - id: mister_stop
+    mode: single
+    then:
+      - lambda: id(mister).publish_state(false);
+      - script.stop: mister_cycle
+      - switch.turn_off: mister_relay
+      - if:
+          condition:
+            lambda: 'return id(fan_runon_time).state >= 1;'
+          then:
+            - script.execute: fan_delayed_off
+          else:
+            - fan.turn_off: mister_fan
+            - lambda: |-
+                id(fan_auto) = false;
+                id(note_fan)->execute(std::string("no run on after mist, set to 0"));
+
+  # Keeps the fan going for a while, then stops it
+  - id: fan_delayed_off
+    mode: restart
+    then:
+      - lambda: |-
+          char b[48];
+          snprintf(b, sizeof(b), "after mist, %.0f min", id(fan_runon_time).state);
+          id(note_fan)->execute(std::string(b));
+          id(fan_auto) = true;
+      - fan.turn_on: mister_fan
+      - delay: !lambda "return (uint32_t)(id(fan_runon_time).state * 60000);"
+      - fan.turn_off: mister_fan
+      - lambda: id(fan_auto) = false;
+
+  # The daily airing run
+  - id: fan_purge
+    mode: restart
+    then:
+      - lambda: |-
+          char b[48];
+          snprintf(b, sizeof(b), "airing, %.0f sec", id(fan_purge_seconds).state);
+          id(note_fan)->execute(std::string(b));
+          id(fan_auto) = true;
+      - fan.turn_on: mister_fan
+      - delay: !lambda "return (uint32_t)(id(fan_purge_seconds).state * 1000);"
+      - fan.turn_off: mister_fan
+      - lambda: id(fan_auto) = false;
+
+  # Waits, airs, repeats, for as long as the switch is on
+  - id: fan_cycle_loop
+    mode: restart
+    then:
+      - while:
+          condition:
+            switch.is_on: fan_cycle_enable
+          then:
+            - delay: !lambda "return (uint32_t)(id(fan_cycle_hours).state * 3600000);"
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: fan_cycle_enable
+                    - switch.is_off: mister
+                then:
+                  - script.execute: fan_purge
+
+switch:
+  - platform: gpio
+    pin: GPIO16
+    id: mister_relay
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # ----- Water -----
+  - platform: template
+    name: "Enable Water Level Control"
+    id: water_control
+    icon: "mdi:water-alert"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 5
+    turn_on_action:
+      - lambda: id(note_setting)->execute(std::string("Water Level Control on"));
+    turn_off_action:
+      - lambda: id(note_setting)->execute(std::string("Water Level Control off"));
+
+  # ----- Light -----
+  - platform: template
+    name: "Enable Light Automation"
+    id: light_auto_enable
+    icon: "mdi:lightbulb-auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_light
+      sorting_weight: 20
+    turn_on_action:
+      - lambda: id(note_setting)->execute(std::string("Light Automation on"));
+      - script.execute: light_check
+    turn_off_action:
+      - lambda: id(note_setting)->execute(std::string("Light Automation off"));
+
+  # ----- Mister -----
+  - platform: template
+    name: "Mister"
+    id: mister
+    icon: "mdi:sprinkler-variant"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 10
+    turn_on_action:
+      - script.execute: mister_cycle
+    turn_off_action:
+      - script.execute: mister_stop
+
+  - platform: template
+    name: "Enable Mist Automation"
+    id: mist_enable
+    icon: "mdi:calendar-clock"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 20
+    turn_on_action:
+      - lambda: id(note_setting)->execute(std::string("Mist Automation on"));
+    turn_off_action:
+      - lambda: id(note_setting)->execute(std::string("Mist Automation off"));
+
+  # ----- Fan -----
+  - platform: template
+    name: "Enable Fan Automation"
+    id: fan_cycle_enable
+    icon: "mdi:fan-auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_fan
+      sorting_weight: 20
+    turn_on_action:
+      - lambda: id(note_setting)->execute(std::string("Fan Automation on"));
+      - script.execute: fan_cycle_loop
+    turn_off_action:
+      - lambda: id(note_setting)->execute(std::string("Fan Automation off"));
+      - script.stop: fan_cycle_loop
+
+  - platform: gpio
+    pin: GPIO23
+    name: "InternalLED"
+    id: internalled
+    internal: true
+    restore_mode: ALWAYS_OFF    esp32_touch: WARN
     # Everything else is left alone on purpose, so real events show up:
     # switches, lights, fans, sliders and scripts.
 
