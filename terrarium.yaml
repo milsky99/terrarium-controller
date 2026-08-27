@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.8"
+  project_version: "1.0.9"
   # Millilitres per minute the mister puts out while spraying.
   # 50ml/hour from the module supplier's figure. Measure your own and
   # change this one line if you want it accurate.
@@ -136,6 +136,9 @@ web_server:
     - id: grp_fan
       name: "Fan"
       sorting_weight: 40
+    - id: grp_buzzer
+      name: "Buzzer"
+      sorting_weight: 45
     - id: grp_history
       name: "History"
       sorting_weight: 70
@@ -410,14 +413,37 @@ button:
       sorting_group_id: grp_system
       sorting_weight: 70
 
+  # ----- Buzzer -----
+  # Names match the original TV Left firmware so entity ids survive.
   - platform: template
-    name: "Test Buzzer"
-    icon: "mdi:bullhorn-outline"
+    name: "Short Beep"
+    id: short_beep_button
+    icon: "mdi:bell-ring-outline"
     web_server:
-      sorting_group_id: grp_system
-      sorting_weight: 72
+      sorting_group_id: grp_buzzer
+      sorting_weight: 10
     on_press:
-      - script.execute: beep
+      - script.execute: short_beep
+
+  - platform: template
+    name: "Alarm 30 sec"
+    id: alarm_30_button
+    icon: "mdi:bell-alert"
+    web_server:
+      sorting_group_id: grp_buzzer
+      sorting_weight: 20
+    on_press:
+      - script.execute: alarm_30s
+
+  - platform: template
+    name: "Water Beep"
+    id: water_beep_button
+    icon: "mdi:water-alert-outline"
+    web_server:
+      sorting_group_id: grp_buzzer
+      sorting_weight: 30
+    on_press:
+      - script.execute: water_beep
 
   - platform: template
     name: "Restore Settings To Defaults"
@@ -1138,7 +1164,7 @@ interval:
                   if (std::isnan(id(water_percent).state)) return false;
                   return id(water_percent).state < id(water_alarm_level).state;
           then:
-            - script.execute: beep
+            - script.execute: water_beep
 
   - interval: 100ms
     then:
@@ -1220,8 +1246,30 @@ fan:
                         - script.execute: fan_delayed_off
 
 script:
-  # A single very short beep. The buzzer is loud, so this stays brief.
-  - id: beep
+  # ----- Buzzer -----
+  # One short beep. Unchanged from the original TV Left firmware.
+  - id: short_beep
+    mode: single
+    then:
+      - output.turn_on: buzzer_output
+      - delay: 500ms
+      - output.turn_off: buzzer_output
+
+  # Half a second on, half a second off, for 30 seconds.
+  - id: alarm_30s
+    mode: restart
+    then:
+      - repeat:
+          count: 30
+          then:
+            - output.turn_on: buzzer_output
+            - delay: 500ms
+            - output.turn_off: buzzer_output
+            - delay: 500ms
+      - output.turn_off: buzzer_output
+
+  # A very short chirp, used only by the low water alarm.
+  - id: water_beep
     mode: restart
     then:
       - output.turn_on: buzzer_output
@@ -1591,7 +1639,7 @@ switch:
       sorting_weight: 6
     turn_on_action:
       - lambda: id(note_setting)->execute(std::string("Water Alarm on"));
-      - script.execute: beep
+      - script.execute: water_beep
     turn_off_action:
       - lambda: id(note_setting)->execute(std::string("Water Alarm off"));
 
