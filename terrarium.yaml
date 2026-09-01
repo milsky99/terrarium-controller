@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.9"
+  project_version: "1.0.11"
   # Millilitres per minute the mister puts out while spraying.
   # 50ml/hour from the module supplier's figure. Measure your own and
   # change this one line if you want it accurate.
@@ -31,6 +31,7 @@ esphome:
       - fan.turn_off: mister_fan
       - light.turn_off: puc_light
       - lambda: |-
+          id(boot_count) += 1;
           id(last_mist_text).publish_state("Never");
           id(last_fan_text).publish_state("Never");
           id(last_light_text).publish_state("Never");
@@ -198,13 +199,23 @@ globals:
     restore_value: no
     initial_value: 'false'
 
+  - id: cycle_i
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: boot_count
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
   - id: boot_logged
     type: bool
     restore_value: no
     initial_value: 'false'
 
   - id: mist_hours
-    type: int[6]
+    type: int[10]
     restore_value: no
 
   - id: mist_hours_n
@@ -280,6 +291,28 @@ sensor:
     internal: true
     update_interval: 60s
 
+  # Counts every start since this firmware went on. A rising number with a
+  # short uptime means the unit is restarting on its own.
+  - platform: template
+    name: "Restart Count"
+    id: restart_count
+    icon: "mdi:restart"
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 66
+    lambda: 'return (float) id(boot_count);'
+
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 67
+
   # ----- Water probe -----
   # Samples once a second. Hidden, it only feeds the averages below.
   - platform: template
@@ -293,7 +326,6 @@ sensor:
     name: "Probe 10 second"
     id: touch_avg_10s
     icon: "mdi:blur"
-    unit_of_measurement: "counts"
     state_class: measurement
     accuracy_decimals: 1
     web_server:
@@ -310,7 +342,6 @@ sensor:
     name: "Probe 3 minute"
     id: touch_avg_3m
     icon: "mdi:blur"
-    unit_of_measurement: "counts"
     state_class: measurement
     accuracy_decimals: 1
     web_server:
@@ -326,7 +357,6 @@ sensor:
     name: "Probe 10 minute"
     id: touch_avg_10m
     icon: "mdi:blur"
-    unit_of_measurement: "counts"
     state_class: measurement
     accuracy_decimals: 1
     web_server:
@@ -376,7 +406,7 @@ sensor:
       sorting_weight: 90
     lambda: |-
       if (!id(mist_enable).state) return 0.0f;
-      float spraying = id(mister_run_time).state * (id(mist_on_seconds).state / 30.0f);
+      float spraying = id(cycle_on_time).state * id(cycle_count).state;
       return spraying * id(mist_count).state * ${mister_ml_per_min};
 
   # ----- Calibration readouts -----
@@ -384,7 +414,6 @@ sensor:
     name: "Calibrated Full"
     id: cal_full_display
     icon: "mdi:cup-water"
-    unit_of_measurement: "counts"
     accuracy_decimals: 0
     update_interval: 30s
     web_server:
@@ -396,7 +425,6 @@ sensor:
     name: "Calibrated Empty"
     id: cal_empty_display
     icon: "mdi:cup-outline"
-    unit_of_measurement: "counts"
     accuracy_decimals: 0
     update_interval: 30s
     web_server:
@@ -708,16 +736,17 @@ text_sensor:
       sorting_group_id: grp_mist
       sorting_weight: 85
     lambda: |-
-      int on = (int) id(mist_on_seconds).state;
-      int off = 30 - on;
-      char b[80];
-      if (on <= 0) {
-        return {"Off time only - the mister will not run"};
+      char b[96];
+      int n = (int) id(cycle_count).state;
+      float on = id(cycle_on_time).state;
+      float off = id(cycle_off_time).state;
+      if (n <= 1) {
+        snprintf(b, sizeof(b), "One spray of %.1f min", on);
+      } else if (off <= 0) {
+        snprintf(b, sizeof(b), "%d sprays of %.1f min, back to back", n, on);
+      } else {
+        snprintf(b, sizeof(b), "%d sprays of %.1f min, %.1f min apart", n, on, off);
       }
-      if (off <= 0) {
-        return {"Runs without stopping for the whole mist duration"};
-      }
-      snprintf(b, sizeof(b), "%d sec on, %d sec off, repeating", on, off);
       return {std::string(b)};
 
   # ----- History -----
@@ -1016,7 +1045,7 @@ number:
     restore_value: true
     initial_value: 2
     min_value: 1
-    max_value: 6
+    max_value: 10
     step: 1
     mode: slider
     web_server:
@@ -1029,16 +1058,19 @@ number:
           id(note_setting)->execute(std::string(b));
       - script.execute: rebuild_schedule
 
+  # Each misting event is a number of cycles. Each cycle sprays for the
+  # on time, then pauses for the off time. The pause is skipped after the
+  # last cycle, so the event ends as soon as the last spray finishes.
   - platform: template
-    name: "Mist Duration"
-    id: mister_run_time
-    icon: "mdi:timer-outline"
+    name: "Cycle On Time"
+    id: cycle_on_time
+    icon: "mdi:timer-play-outline"
     optimistic: true
     restore_value: true
-    initial_value: 5
-    min_value: 1
-    max_value: 10
-    step: 1
+    initial_value: 2
+    min_value: 0.5
+    max_value: 5
+    step: 0.5
     unit_of_measurement: "min"
     mode: slider
     web_server:
@@ -1047,30 +1079,50 @@ number:
     on_value:
       - lambda: |-
           char b[64];
-          snprintf(b, sizeof(b), "Mist Duration to %.0f min", x);
+          snprintf(b, sizeof(b), "Cycle On Time to %.1f min", x);
           id(note_setting)->execute(std::string(b));
+      - component.update: mist_pattern_text
 
-  # How many of every 30 seconds the mister is actually spraying.
-  # 30 means it never pauses. 0 means it never sprays.
   - platform: template
-    name: "Mist On Time"
-    id: mist_on_seconds
-    icon: "mdi:timer-play-outline"
+    name: "Cycle Off Time"
+    id: cycle_off_time
+    icon: "mdi:timer-pause-outline"
     optimistic: true
     restore_value: true
-    initial_value: 22
+    initial_value: 1
     min_value: 0
-    max_value: 30
+    max_value: 5
+    step: 0.5
+    unit_of_measurement: "min"
+    mode: slider
+    web_server:
+      sorting_group_id: grp_mist
+      sorting_weight: 75
+    on_value:
+      - lambda: |-
+          char b[64];
+          snprintf(b, sizeof(b), "Cycle Off Time to %.1f min", x);
+          id(note_setting)->execute(std::string(b));
+      - component.update: mist_pattern_text
+
+  - platform: template
+    name: "Number Of Cycles"
+    id: cycle_count
+    icon: "mdi:repeat"
+    optimistic: true
+    restore_value: true
+    initial_value: 2
+    min_value: 1
+    max_value: 5
     step: 1
-    unit_of_measurement: "s"
     mode: slider
     web_server:
       sorting_group_id: grp_mist
       sorting_weight: 80
     on_value:
       - lambda: |-
-          char b[72];
-          snprintf(b, sizeof(b), "Mist On Time to %.0f sec in every 30", x);
+          char b[64];
+          snprintf(b, sizeof(b), "Number Of Cycles to %.0f", x);
           id(note_setting)->execute(std::string(b));
       - component.update: mist_pattern_text
 
@@ -1288,8 +1340,9 @@ script:
           id(mist_start_hour).publish_state(8);
           id(mist_end_hour).publish_state(15);
           id(mist_count).publish_state(2);
-          id(mister_run_time).publish_state(5);
-          id(mist_on_seconds).publish_state(22);
+          id(cycle_on_time).publish_state(2);
+          id(cycle_off_time).publish_state(1);
+          id(cycle_count).publish_state(2);
           id(fan_cycle_hours).publish_state(4);
           id(fan_purge_seconds).publish_state(30);
           id(fan_runon_time).publish_state(0);
@@ -1425,7 +1478,7 @@ script:
           int end   = (int) id(mist_end_hour).state;
           int n     = (int) id(mist_count).state;
           if (n < 1) n = 1;
-          if (n > 6) n = 6;
+          if (n > 10) n = 10;
 
           int window = end - start;
           if (window < 0) window += 24;
@@ -1501,23 +1554,24 @@ script:
             - lambda: |-
                 auto t = id(board_time).now();
                 std::string ts = t.is_valid() ? t.strftime("%a %H:%M") : std::string("no clock");
-                char b[80];
-                snprintf(b, sizeof(b), "%s - %.0f min, %.0f sec on in every 30",
-                         ts.c_str(), id(mister_run_time).state, id(mist_on_seconds).state);
+                char b[96];
+                snprintf(b, sizeof(b), "%s - %.0f cycles of %.1f min on, %.1f min off",
+                         ts.c_str(), id(cycle_count).state,
+                         id(cycle_on_time).state, id(cycle_off_time).state);
                 id(last_mist_text).publish_state(std::string(b));
                 id(mister).publish_state(true);
+                id(cycle_i) = 0;
             - script.execute:
                 id: note_history
                 what: !lambda |-
                   char c[64];
-                  snprintf(c, sizeof(c), "mist started, %.0f min", id(mister_run_time).state);
+                  snprintf(c, sizeof(c), "mist started, %.0f cycles", id(cycle_count).state);
                   return std::string(c);
             - script.stop: fan_delayed_off
             - script.stop: fan_purge
             - lambda: id(fan_auto) = true;
             - repeat:
-                # Each block is 30 seconds, spray time plus pause time
-                count: !lambda "return (uint32_t)((id(mister_run_time).state * 60.0) / 30.0);"
+                count: !lambda "return (uint32_t) id(cycle_count).state;"
                 then:
                   - if:
                       condition:
@@ -1525,22 +1579,21 @@ script:
                           - switch.is_off: water_control
                           - binary_sensor.is_off: water_low
                       then:
-                        # Spray part of the block, skipped when set to 0
+                        # Spray
+                        - fan.turn_on: mister_fan
+                        - switch.turn_on: mister_relay
+                        - delay: !lambda "return (uint32_t)(id(cycle_on_time).state * 60000);"
+                        - switch.turn_off: mister_relay
+                        - lambda: id(cycle_i) += 1;
+                        # Pause, skipped after the last cycle
                         - if:
                             condition:
-                              lambda: 'return id(mist_on_seconds).state >= 1;'
-                            then:
-                              - fan.turn_on: mister_fan
-                              - switch.turn_on: mister_relay
-                              - delay: !lambda "return (uint32_t)(id(mist_on_seconds).state * 1000);"
-                              - switch.turn_off: mister_relay
-                        # Pause part of the block, skipped when set to 30
-                        - if:
-                            condition:
-                              lambda: 'return id(mist_on_seconds).state <= 29;'
+                              lambda: |-
+                                return id(cycle_i) < (int) id(cycle_count).state
+                                       && id(cycle_off_time).state > 0;
                             then:
                               - fan.turn_off: mister_fan
-                              - delay: !lambda "return (uint32_t)((30.0 - id(mist_on_seconds).state) * 1000);"
+                              - delay: !lambda "return (uint32_t)(id(cycle_off_time).state * 60000);"
             - script.execute: mister_stop
 
   # The single shutdown routine everything uses
