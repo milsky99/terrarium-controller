@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.11"
+  project_version: "1.0.12"
   # Millilitres per minute the mister puts out while spraying.
   # 50ml/hour from the module supplier's figure. Measure your own and
   # change this one line if you want it accurate.
@@ -108,11 +108,16 @@ update:
 # No network saved. On first boot the unit starts its own open hotspot
 # named after the device, so the code shown in the phone's WiFi list is
 # the same code used to reach the unit later.
-# reboot_timeout 0s means a router outage does not interrupt misting.
-# The fallback hotspot still appears when the network is genuinely gone.
+# ap_timeout 10min: short router blips no longer start the hotspot.
+# A new unit with no saved network still starts it straight away.
+# power_save_mode none: radio stays awake, steadier on mesh routers.
+# post_connect_roaming false: no 5 minute scans for a better router.
+# Recovery when stuck off the network is handled by WiFi Watchdog below.
 wifi:
-  reboot_timeout: 0s
+  power_save_mode: none
+  post_connect_roaming: false
   ap:
+    ap_timeout: 10min
 
 captive_portal:
 
@@ -1217,6 +1222,26 @@ interval:
                   return id(water_percent).state < id(water_alarm_level).state;
           then:
             - script.execute: water_beep
+
+  # WiFi Watchdog. After 15 minutes off the network, restarts the unit
+  # once, but never while misting. Only fires if the unit had WiFi since
+  # it last started, so a real router outage causes one restart at most.
+  - interval: 1min
+    then:
+      - lambda: |-
+          static bool had_wifi = false;
+          static uint8_t mins_off = 0;
+          if (wifi::global_wifi_component->is_connected()) {
+            had_wifi = true;
+            mins_off = 0;
+            return;
+          }
+          if (mins_off < 255) mins_off++;
+          if (had_wifi && mins_off >= 15 &&
+              !id(mister).state && !id(mister_cycle).is_running()) {
+            ESP_LOGW("watchdog", "No WiFi for 15 minutes, restarting");
+            App.safe_reboot();
+          }
 
   - interval: 100ms
     then:
