@@ -7,7 +7,7 @@
 substitutions:
   device_name: plant
   device_friendly_name: Plant
-  project_version: "1.0.12"
+  project_version: "1.1.0"
   # Millilitres per minute the mister puts out while spraying.
   # 50ml/hour from the module supplier's figure. Measure your own and
   # change this one line if you want it accurate.
@@ -205,6 +205,8 @@ time:
                       int on = (int) id(light_start_hour).state;
                       int off = (int) id(light_end_hour).state;
                       if (on == off) return false;
+                      int dark = ((on - off) % 24 + 24) % 24 * 60;
+                      if (len > dark) len = dark;
                       auto t = id(board_time).now();
                       int m = t.hour * 60 + t.minute;
                       int start = ((on * 60 - len) % 1440 + 1440) % 1440;
@@ -1267,9 +1269,7 @@ fan:
     on_turn_off:
       - if:
           condition:
-            and:
-              - lambda: 'return !id(fan_auto);'
-              - switch.is_on: mister
+            switch.is_on: mister
           then:
             - script.execute: mister_stop
 
@@ -1309,18 +1309,18 @@ script:
   - id: restore_defaults
     mode: single
     then:
+      - number.set: { id: min_water_level, value: 20 }
+      - number.set: { id: water_alarm_level, value: 30 }
+      - number.set: { id: light_start_hour, value: 12 }
+      - number.set: { id: light_end_hour, value: 22 }
+      - number.set: { id: mist_count, value: 4 }
+      - number.set: { id: mist_on_time, value: 2 }
+      - number.set: { id: fan_cycle_hours, value: 4 }
+      - number.set: { id: fan_purge_seconds, value: 30 }
+      - number.set: { id: dry_period_hours, value: 2 }
+      - number.set: { id: dry_fan_interval, value: 30 }
+      - number.set: { id: dry_fan_run, value: 5 }
       - lambda: |-
-          id(min_water_level).publish_state(20);
-          id(light_start_hour).publish_state(12);
-          id(light_end_hour).publish_state(22);
-          id(mist_count).publish_state(4);
-          id(mist_on_time).publish_state(2);
-          id(fan_cycle_hours).publish_state(4);
-          id(fan_purge_seconds).publish_state(30);
-          id(dry_period_hours).publish_state(2);
-          id(dry_fan_interval).publish_state(30);
-          id(dry_fan_run).publish_state(5);
-
           id(cal_full) = 500.0f;
           id(cal_empty) = 1403.0f;
           id(cal_last) = 0;
@@ -1451,6 +1451,13 @@ script:
     mode: queued
     then:
       - lambda: |-
+          // Settings not loaded yet. This runs again once the clock syncs.
+          if (std::isnan(id(light_start_hour).state) || std::isnan(id(light_end_hour).state) ||
+              std::isnan(id(dry_period_hours).state) || std::isnan(id(dry_fan_interval).state) ||
+              std::isnan(id(dry_fan_run).state) || std::isnan(id(mist_on_time).state) ||
+              std::isnan(id(mist_count).state)) {
+            return;
+          }
           int on   = (int) id(light_start_hour).state;
           int off  = (int) id(light_end_hour).state;
           int len  = (int)(id(dry_period_hours).state * 60.0f);
@@ -1462,6 +1469,12 @@ script:
           if (want > 10) want = 10;
           char b[160];
           id(mist_mins_n) = 0;
+
+          // The dry period can never be longer than the night
+          if (on != off) {
+            int dark_all = ((on - off) % 24 + 24) % 24 * 60;
+            if (len > dark_all) len = dark_all;
+          }
 
           // ----- Dry period readout -----
           if (on == off) {
@@ -1610,6 +1623,7 @@ script:
           snprintf(b, sizeof(b), "dry period, %.0f min", id(dry_fan_run).state);
           id(note_fan)->execute(std::string(b));
           id(fan_auto) = true;
+      - script.stop: fan_purge
       - fan.turn_on: mister_fan
       - delay: !lambda "return (uint32_t)(id(dry_fan_run).state * 60000);"
       - fan.turn_off: mister_fan
@@ -1631,6 +1645,7 @@ script:
                     - switch.is_on: fan_cycle_enable
                     - switch.is_off: mister
                     - light.is_on: puc_light
+                    - lambda: 'return !id(fan_dry).is_running();'
                 then:
                   - script.execute: fan_purge
 
